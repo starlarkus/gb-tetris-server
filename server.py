@@ -88,10 +88,50 @@ class Game:
     GAME_STATE_BETWEEN = 2
     GAME_STATE_FINISHED = 3
 
+#    def _generate_name(self):
+#        lobby_name = ''.join(random.choice(string.ascii_uppercase) for i in range(4))
+#        print('lobby created with name', lobby_name)
+#        return lobby_name
+#
+#   generate lobby name with number
+
     def _generate_name(self):
-        lobby_name = ''.join(random.choice(string.ascii_uppercase) for i in range(4))
-        print('lobby created with name', lobby_name)
-        return lobby_name
+        # Access the global 'games' dictionary to see what is already taken
+        # This works because python resolves globals at runtime
+        global games 
+        existing_ids = set(games.keys())
+
+        # Tier 1: Try 0 - 99 first
+        # We create a set of all numbers 0-99, then subtract existing ones
+        tier1 = set(str(i) for i in range(100))
+        available_tier1 = list(tier1 - existing_ids)
+        
+        if available_tier1:
+            lobby_name = random.choice(available_tier1)
+            print('lobby created with name', lobby_name)
+            return lobby_name
+
+        # Tier 2: Try 100 - 999
+        tier2 = set(str(i) for i in range(100, 1000))
+        available_tier2 = list(tier2 - existing_ids)
+        
+        if available_tier2:
+            lobby_name = random.choice(available_tier2)
+            print('lobby created with name', lobby_name)
+            return lobby_name
+
+        # Tier 3: Try 1000 - 9999
+        tier3 = set(str(i) for i in range(1000, 10000))
+        available_tier3 = list(tier3 - existing_ids)
+        
+        if available_tier3:
+            lobby_name = random.choice(available_tier3)
+            print('lobby created with name', lobby_name)
+            return lobby_name
+
+        # If we get here, the server has 10,000 active games!
+        raise Exception("Server is full: No available lobby IDs.")
+
 
     def __init__(self, admin_socket):
         self.name = self._generate_name()
