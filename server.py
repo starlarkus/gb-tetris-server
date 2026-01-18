@@ -448,10 +448,11 @@ async def newserver(websocket, path):
 
 
 
-ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+#ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 
-ssl_context.load_cert_chain(certfile=FULLCHAIN_CERT_PATH, keyfile=PRIVKEY_PATH)
+#ssl_context.load_cert_chain(certfile='/home/starlark/keys/cert.pem', keyfile='/home/starlark/keys/keynp.key')
 
-start_server = websockets.serve(newserver, '0.0.0.0', WEBSOCKET_PORT, ping_interval=None, ssl=ssl_context)
+#ssl=ssl_context
+start_server = websockets.serve(newserver, '0.0.0.0', 5678, ping_interval=None)
 asyncio.get_event_loop().run_until_complete(start_server)
 asyncio.get_event_loop().run_forever()
