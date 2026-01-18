@@ -375,7 +375,8 @@ def parse_register_msg(msg):
     
     return j
 
-async def newserver(websocket, path):
+async def newserver(websocket):
+    path = websocket.request.path  # Modern websockets API
     print("Newserver")
     # First wait for registration message.
     # Without it we don't do anything.
