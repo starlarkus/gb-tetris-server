@@ -15,16 +15,9 @@ import random
 import websockets
 import string
 import ssl
-import os
-import dotenv
 # Global scope #YOLO
 active_games = {
 }
-
-dotenv.load_dotenv('.env')
-WEBSOCKET_PORT = os.getenv('WEBSOCKET_PORT')
-FULLCHAIN_CERT_PATH = os.getenv('FULLCHAIN_CERT_PATH')
-PRIVKEY_PATH = os.getenv('PRIVKEY_PATH')
 
 # Because Python sucks
 class Game:
@@ -448,11 +441,8 @@ async def newserver(websocket, path):
 
 
 
-#ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+async def main():
+    async with websockets.serve(newserver, '0.0.0.0', 5678, ping_interval=None):
+        await asyncio.get_running_loop().create_future()  # run forever
 
-#ssl_context.load_cert_chain(certfile='/home/starlark/keys/cert.pem', keyfile='/home/starlark/keys/keynp.key')
-
-#ssl=ssl_context
-start_server = websockets.serve(newserver, '0.0.0.0', 5678, ping_interval=None)
-asyncio.get_event_loop().run_until_complete(start_server)
-asyncio.get_event_loop().run_forever()
+asyncio.run(main())
