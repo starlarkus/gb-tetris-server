@@ -20,6 +20,7 @@ apt install python3 python3-pip git
 pip install websockets
 
 # Clone and run
+cd ~
 git clone --depth 1 https://github.com/starlarkus/gb-tetris-server
 cd gb-tetris-server
 python3 server.py
@@ -28,3 +29,14 @@ python3 server.py
 ## Usage
 
 The server runs on port `5678` by default. Configure your reverse proxy (nginx, caddy, etc.) to forward WebSocket connections to this port.
+
+## Auto-start
+
+```bash
+apt install screen
+chmod +x startdetached.sh
+crontab -e
+@reboot screen -S tetrisserver -d -m ~/gb-tetris-server/startdetached.sh
+```
+
+Access the running server window with `screen -r tetrisserver`
