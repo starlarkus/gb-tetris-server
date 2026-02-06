@@ -19,6 +19,8 @@ import ssl
 active_games = {
 }
 
+matchmaking_queue = []  # List of Client objects waiting for a match
+
 # Because Python sucks
 class Game:
     pass
@@ -126,12 +128,13 @@ class Game:
         raise Exception("Server is full: No available lobby IDs.")
 
 
-    def __init__(self, admin_socket):
+    def __init__(self, admin_socket, is_matchmaking=False):
         self.name = self._generate_name()
         self.admin_socket = admin_socket
         self.clients = [admin_socket]
         self.state = self.GAME_STATE_LOBBY
         self.preset_rng = {'garbage': None, 'pieces': None, 'well_column': None} # if None, generate using near GB RNG
+        self.is_matchmaking = is_matchmaking
     
     def get_gameinfo(self):
         users = []
@@ -354,6 +357,46 @@ class Game:
                 }))
                 self.state = self.GAME_STATE_BETWEEN
             await self.send_gameinfo()
+
+    async def handle_client_disconnect(self, disconnected_client):
+        """Handle when a client disconnects from the game."""
+        print(f"Client {disconnected_client.name} disconnected from game {self.name}")
+        
+        # Remove client from the game
+        if disconnected_client in self.clients:
+            self.clients.remove(disconnected_client)
+        
+        # If game is running, notify remaining players and determine winner
+        if self.state == self.GAME_STATE_RUNNING:
+            disconnected_client.set_dead()
+            
+            # Check if only one player remains
+            alive_count = self.alive_count()
+            if alive_count == 1:
+                winner = self.get_last_alive()
+                if winner:
+                    winner.set_winner()
+                    # Send opponent disconnect notification
+                    await winner.send(json.dumps({
+                        "type": "opponent_disconnect"
+                    }))
+                    await winner.send(json.dumps({
+                        "type": "win"
+                    }))
+                self.state = self.GAME_STATE_BETWEEN
+            elif alive_count == 0:
+                # Everyone disconnected
+                self.state = self.GAME_STATE_FINISHED
+            else:
+                # Notify remaining players about the disconnect
+                for c in self.clients:
+                    await c.send(json.dumps({
+                        "type": "opponent_disconnect"
+                    }))
+        
+        # If no clients left, mark game as finished
+        if len(self.clients) == 0:
+            self.state = self.GAME_STATE_FINISHED
         
             
 
@@ -414,7 +457,11 @@ async def newserver(websocket):
 
         games[new_game.name] = new_game
 
-        await client.process()
+        try:
+            await client.process()
+        except websockets.exceptions.ConnectionClosed:
+            print(f"Client {client.name} disconnected from created game")
+            await new_game.handle_client_disconnect(client)
     # Or join an existing game
     elif(path.startswith("/join/")):
         game_name = path[6:].upper()
@@ -434,7 +481,70 @@ async def newserver(websocket):
 
         print("Sending gameinfo..")
         await game.send_gameinfo()
-        await client.process()
+        try:
+            await client.process()
+        except websockets.exceptions.ConnectionClosed:
+            print(f"Client {client.name} disconnected")
+            await game.handle_client_disconnect(client)
+    
+    # Matchmaking
+    elif(path == "/matchmake"):
+        print("Matchmaking request")
+        matchmaking_queue.append(client)
+        
+        # Check if we can pair players
+        if len(matchmaking_queue) >= 2:
+            # Pop two players from the queue
+            player1 = matchmaking_queue.pop(0)
+            player2 = matchmaking_queue.pop(0)
+            
+            print(f"Pairing {player1.name} with {player2.name}")
+            
+            # Create a new matchmaking game with player1 as admin
+            new_game = Game(player1, is_matchmaking=True)
+            while new_game.name in games:
+                new_game = Game(player1, is_matchmaking=True)
+            
+            player1.set_game(new_game)
+            player2.set_game(new_game)
+            
+            # Add player2 to the game
+            new_game.clients.append(player2)
+            games[new_game.name] = new_game
+            
+            # Send match_found to both players
+            match_info = {
+                "type": "match_found",
+                "name": new_game.name,
+                "users": [c.serialize() for c in new_game.clients]
+            }
+            await player1.send(json.dumps(match_info))
+            await player2.send(json.dumps(match_info))
+            
+            # Auto-start the game
+            await new_game.start_game()
+            
+            # Process both clients (player1 is admin but on matchmaking both process)
+            try:
+                await client.process()
+            except websockets.exceptions.ConnectionClosed:
+                print(f"Client {client.name} disconnected during matchmaking game")
+                await new_game.handle_client_disconnect(client)
+        else:
+            # Wait in queue - the client will be processed when matched
+            print(f"{client.name} waiting in matchmaking queue (queue size: {len(matchmaking_queue)})")
+            try:
+                async for msg in client.socket:
+                    data = json.loads(msg)
+                    if data.get("type") == "cancel_matchmaking":
+                        print(f"{client.name} cancelled matchmaking")
+                        if client in matchmaking_queue:
+                            matchmaking_queue.remove(client)
+                        return
+            except websockets.exceptions.ConnectionClosed:
+                print(f"{client.name} disconnected while waiting in queue")
+                if client in matchmaking_queue:
+                    matchmaking_queue.remove(client)
 
         
     else:
