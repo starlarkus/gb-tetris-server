@@ -19,6 +19,8 @@ import ssl
 active_games = {
 }
 
+matchmaking_queue = []  # List of Client objects waiting for a match
+
 # Because Python sucks
 class Game:
     pass
@@ -126,12 +128,15 @@ class Game:
         raise Exception("Server is full: No available lobby IDs.")
 
 
-    def __init__(self, admin_socket):
+    def __init__(self, admin_socket, is_matchmaking=False):
         self.name = self._generate_name()
         self.admin_socket = admin_socket
         self.clients = [admin_socket]
         self.state = self.GAME_STATE_LOBBY
         self.preset_rng = {'garbage': None, 'pieces': None, 'well_column': None} # if None, generate using near GB RNG
+        self.is_matchmaking = is_matchmaking
+        self.ready_clients = set()
+        self.ready_timer = None
     
     def get_gameinfo(self):
         users = []
@@ -142,42 +147,57 @@ class Game:
             "type": "game_info",
             "name": self.name,
             "status": self.state,
-            "users": users
+            "users": users,
+            "admin_uuid": self.admin_socket.uuid if self.admin_socket else None
         }
 
     async def send_lines(self, lines, sender_uuid):
-        for c in self.clients:
+        for c in list(self.clients):
             if c.uuid == sender_uuid:
-                # Don't send lines to sender
                 continue
-            await c.send(json.dumps({
-                "type": "lines",
-                "lines": lines
-            }))
+            try:
+                await c.send(json.dumps({
+                    "type": "lines",
+                    "lines": lines
+                }))
+            except websockets.exceptions.ConnectionClosed:
+                print(f"send_lines failed - {c.name} already disconnected")
+                await self.handle_client_disconnect(c)
 
     async def send_reached_30_lines(self, sender_uuid):
-        for c in self.clients:
+        for c in list(self.clients):
             if c.uuid == sender_uuid:
-                # Don't send to sender
                 continue
             print("sending reached lines")
-            await c.send(json.dumps({
-                "type": "reached_30_lines"
-            }))
+            try:
+                await c.send(json.dumps({
+                    "type": "reached_30_lines"
+                }))
+            except websockets.exceptions.ConnectionClosed:
+                print(f"send_reached_30_lines failed - {c.name} already disconnected")
+                await self.handle_client_disconnect(c)
 
     async def send_gameinfo(self):
-        for s in self.clients:
+        for s in list(self.clients):
             await self.send_gameinfo_client(s)
 
     async def send_gameinfo_client(self, client):
         game_info = json.dumps(self.get_gameinfo())
-        await client.send(game_info)
+        try:
+            await client.send(game_info)
+        except websockets.exceptions.ConnectionClosed:
+            print(f"send_gameinfo failed - {client.name} already disconnected")
+            await self.handle_client_disconnect(client)
 
 
     async def send_all(self, data):
-        for c in self.clients:
-            # TODO: Serialized, might wanna create_task here
-            await c.send(json.dumps(data))
+        msg = json.dumps(data)
+        for c in list(self.clients):
+            try:
+                await c.send(msg)
+            except websockets.exceptions.ConnectionClosed:
+                print(f"send_all failed - {c.name} already disconnected")
+                await self.handle_client_disconnect(c)
 
 
     async def add_client(self, client):
@@ -187,6 +207,10 @@ class Game:
         await self.send_gameinfo()
 
     async def start_game(self):
+        self.ready_clients = set()
+        if self.ready_timer:
+            self.ready_timer.cancel()
+            self.ready_timer = None
         self.state = self.GAME_STATE_RUNNING
         for c in self.clients:
             c.state = Client.STATE_ALIVE
@@ -291,6 +315,10 @@ class Game:
             if client != self.admin_socket:
                 print("Error: Not an admin.")
                 return
+            # Need at least 2 players
+            if len(self.clients) < 2:
+                print("Error: Not enough players to start.")
+                return
             print("Starting game!")
             await self.start_game()
         elif msg["type"] == "update":
@@ -354,6 +382,103 @@ class Game:
                 }))
                 self.state = self.GAME_STATE_BETWEEN
             await self.send_gameinfo()
+        elif msg["type"] == "ready_next":
+            if self.state != self.GAME_STATE_BETWEEN:
+                return
+            if not self.is_matchmaking:
+                return
+            self.ready_clients.add(client.uuid)
+            await self.send_all({"type": "player_ready", "uuid": client.uuid})
+            if len(self.ready_clients) >= len(self.clients):
+                if self.ready_timer:
+                    self.ready_timer.cancel()
+                    self.ready_timer = None
+                await self.start_game()
+            elif len(self.ready_clients) == 1:
+                await self.send_all({"type": "countdown_started", "seconds": 10})
+                self.ready_timer = asyncio.get_event_loop().call_later(
+                    10, lambda: asyncio.ensure_future(self.start_game())
+                )
+
+    async def handle_client_disconnect(self, disconnected_client):
+        """Handle when a client disconnects from the game."""
+        print(f"Client {disconnected_client.name} disconnected from game {self.name}")
+
+        # Remove client from the game
+        if disconnected_client in self.clients:
+            self.clients.remove(disconnected_client)
+
+        # Reassign admin if the host left and there are remaining players
+        if disconnected_client == self.admin_socket and len(self.clients) > 0:
+            self.admin_socket = self.clients[0]
+            print(f"Admin reassigned to {self.admin_socket.name}")
+
+        # Cancel ready timer if running
+        if self.ready_timer:
+            self.ready_timer.cancel()
+            self.ready_timer = None
+        self.ready_clients.discard(disconnected_client.uuid)
+
+        # If game is running, notify remaining players and determine winner
+        if self.state == self.GAME_STATE_RUNNING:
+            disconnected_client.set_dead()
+
+            # Check if only one player remains
+            alive_count = self.alive_count()
+            if alive_count == 1:
+                winner = self.get_last_alive()
+                if winner:
+                    winner.set_winner()
+                    try:
+                        # Send opponent disconnect notification
+                        await winner.send(json.dumps({
+                            "type": "opponent_disconnect"
+                        }))
+                        # Only send win for private lobbies - matchmaking clients
+                        # handle the win sequence themselves and auto-reconnect
+                        if not self.is_matchmaking:
+                            await winner.send(json.dumps({
+                                "type": "win"
+                            }))
+                    except websockets.exceptions.ConnectionClosed:
+                        print(f"Winner {winner.name} also disconnected")
+                # For matchmaking, set FINISHED so process() exits and the
+                # server closes the WebSocket, triggering client auto-reconnect
+                if self.is_matchmaking:
+                    self.state = self.GAME_STATE_FINISHED
+                else:
+                    self.state = self.GAME_STATE_BETWEEN
+            elif alive_count == 0:
+                # Everyone disconnected
+                self.state = self.GAME_STATE_FINISHED
+            else:
+                # Multiple players still alive - game continues, just update info
+                await self.send_gameinfo()
+
+        elif self.state == self.GAME_STATE_BETWEEN:
+            if len(self.clients) <= 1:
+                # Last opponent left - notify and end
+                for c in list(self.clients):
+                    try:
+                        await c.send(json.dumps({
+                            "type": "opponent_disconnect"
+                        }))
+                    except websockets.exceptions.ConnectionClosed:
+                        print(f"Notify failed - {c.name} also disconnected")
+                self.state = self.GAME_STATE_FINISHED
+            else:
+                # Still multiple players - just update the roster
+                await self.send_gameinfo()
+
+        elif self.state == self.GAME_STATE_LOBBY:
+            # Notify remaining players about updated roster
+            await self.send_gameinfo()
+
+        # If no clients left, mark game as finished and clean up
+        if len(self.clients) == 0:
+            self.state = self.GAME_STATE_FINISHED
+            if self.name in games:
+                del games[self.name]
         
             
 
@@ -414,7 +539,11 @@ async def newserver(websocket):
 
         games[new_game.name] = new_game
 
-        await client.process()
+        try:
+            await client.process()
+        except websockets.exceptions.ConnectionClosed:
+            print(f"Client {client.name} disconnected from created game")
+            await new_game.handle_client_disconnect(client)
     # Or join an existing game
     elif(path.startswith("/join/")):
         game_name = path[6:].upper()
@@ -434,7 +563,109 @@ async def newserver(websocket):
 
         print("Sending gameinfo..")
         await game.send_gameinfo()
-        await client.process()
+        try:
+            await client.process()
+        except websockets.exceptions.ConnectionClosed:
+            print(f"Client {client.name} disconnected")
+            await game.handle_client_disconnect(client)
+    
+    # Matchmaking
+    elif(path == "/matchmake"):
+        print("Matchmaking request")
+        client.match_event = asyncio.Event()
+        matchmaking_queue.append(client)
+
+        # Check if we can pair players
+        if len(matchmaking_queue) >= 2:
+            # Pop two players from the queue
+            player1 = matchmaking_queue.pop(0)
+            player2 = matchmaking_queue.pop(0)
+
+            print(f"Pairing {player1.name} with {player2.name}")
+
+            # Create a new matchmaking game with player1 as admin
+            new_game = Game(player1, is_matchmaking=True)
+            while new_game.name in games:
+                new_game = Game(player1, is_matchmaking=True)
+
+            player1.set_game(new_game)
+            player2.set_game(new_game)
+
+            # Add player2 to the game
+            new_game.clients.append(player2)
+            games[new_game.name] = new_game
+
+            # Send match_found to both players
+            match_info = {
+                "type": "match_found",
+                "name": new_game.name,
+                "users": [c.serialize() for c in new_game.clients]
+            }
+            await player1.send(json.dumps(match_info))
+            await player2.send(json.dumps(match_info))
+
+            # Auto-start the game
+            await new_game.start_game()
+
+            # Signal player1 to break out of wait loop and start processing
+            player1.match_event.set()
+
+            # Process player2 (current client)
+            try:
+                await client.process()
+            except websockets.exceptions.ConnectionClosed:
+                print(f"Client {client.name} disconnected during matchmaking game")
+                await new_game.handle_client_disconnect(client)
+        else:
+            # Wait in queue until matched or cancelled
+            print(f"{client.name} waiting in matchmaking queue (queue size: {len(matchmaking_queue)})")
+            matched = False
+            try:
+                while True:
+                    recv_task = asyncio.create_task(client.socket.recv())
+                    match_task = asyncio.create_task(client.match_event.wait())
+
+                    done, pending = await asyncio.wait(
+                        [recv_task, match_task],
+                        return_when=asyncio.FIRST_COMPLETED
+                    )
+
+                    for task in pending:
+                        task.cancel()
+                        try:
+                            await task
+                        except (asyncio.CancelledError, websockets.exceptions.ConnectionClosed, Exception):
+                            pass
+
+                    if match_task in done:
+                        # We've been matched - break out to process game
+                        matched = True
+                        break
+
+                    if recv_task in done:
+                        msg = recv_task.result()
+                        data = json.loads(msg)
+                        if data.get("type") == "cancel_matchmaking":
+                            print(f"{client.name} cancelled matchmaking")
+                            if client in matchmaking_queue:
+                                matchmaking_queue.remove(client)
+                            return
+            except websockets.exceptions.ConnectionClosed:
+                print(f"{client.name} disconnected while waiting in queue")
+                if client in matchmaking_queue:
+                    matchmaking_queue.remove(client)
+                if client.game:
+                    await client.game.handle_client_disconnect(client)
+                return
+
+            # Matched - now process game messages
+            if matched:
+                try:
+                    await client.process()
+                except websockets.exceptions.ConnectionClosed:
+                    print(f"Client {client.name} disconnected during matchmaking game")
+                    if client.game:
+                        await client.game.handle_client_disconnect(client)
 
         
     else:
@@ -443,7 +674,7 @@ async def newserver(websocket):
 
 
 async def main():
-    async with websockets.serve(newserver, '0.0.0.0', 5678, ping_interval=None):
+    async with websockets.serve(newserver, '0.0.0.0', 5678, ping_interval=5, ping_timeout=5):
         await asyncio.get_running_loop().create_future()  # run forever
 
 asyncio.run(main())
