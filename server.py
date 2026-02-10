@@ -65,8 +65,11 @@ class Client:
 
     async def send(self, f):
         print("Sending..")
-        await self.socket.send(f)
-        print("Done")
+        try:
+            await self.socket.send(f)
+            print("Done")
+        except websockets.exceptions.ConnectionClosed:
+            print(f"Send failed - {self.name} already disconnected")
     
     def serialize(self):
         return {
