@@ -635,7 +635,7 @@ async def newserver(websocket):
 
 
 async def main():
-    async with websockets.serve(newserver, '0.0.0.0', 5678, ping_interval=None):
+    async with websockets.serve(newserver, '0.0.0.0', 5678, ping_interval=5, ping_timeout=5):
         await asyncio.get_running_loop().create_future()  # run forever
 
 asyncio.run(main())
