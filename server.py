@@ -65,11 +65,8 @@ class Client:
 
     async def send(self, f):
         print("Sending..")
-        try:
-            await self.socket.send(f)
-            print("Done")
-        except websockets.exceptions.ConnectionClosed:
-            print(f"Send failed - {self.name} already disconnected")
+        await self.socket.send(f)
+        print("Done")
     
     def serialize(self):
         return {
@@ -150,42 +147,57 @@ class Game:
             "type": "game_info",
             "name": self.name,
             "status": self.state,
-            "users": users
+            "users": users,
+            "admin_uuid": self.admin_socket.uuid if self.admin_socket else None
         }
 
     async def send_lines(self, lines, sender_uuid):
-        for c in self.clients:
+        for c in list(self.clients):
             if c.uuid == sender_uuid:
-                # Don't send lines to sender
                 continue
-            await c.send(json.dumps({
-                "type": "lines",
-                "lines": lines
-            }))
+            try:
+                await c.send(json.dumps({
+                    "type": "lines",
+                    "lines": lines
+                }))
+            except websockets.exceptions.ConnectionClosed:
+                print(f"send_lines failed - {c.name} already disconnected")
+                await self.handle_client_disconnect(c)
 
     async def send_reached_30_lines(self, sender_uuid):
-        for c in self.clients:
+        for c in list(self.clients):
             if c.uuid == sender_uuid:
-                # Don't send to sender
                 continue
             print("sending reached lines")
-            await c.send(json.dumps({
-                "type": "reached_30_lines"
-            }))
+            try:
+                await c.send(json.dumps({
+                    "type": "reached_30_lines"
+                }))
+            except websockets.exceptions.ConnectionClosed:
+                print(f"send_reached_30_lines failed - {c.name} already disconnected")
+                await self.handle_client_disconnect(c)
 
     async def send_gameinfo(self):
-        for s in self.clients:
+        for s in list(self.clients):
             await self.send_gameinfo_client(s)
 
     async def send_gameinfo_client(self, client):
         game_info = json.dumps(self.get_gameinfo())
-        await client.send(game_info)
+        try:
+            await client.send(game_info)
+        except websockets.exceptions.ConnectionClosed:
+            print(f"send_gameinfo failed - {client.name} already disconnected")
+            await self.handle_client_disconnect(client)
 
 
     async def send_all(self, data):
-        for c in self.clients:
-            # TODO: Serialized, might wanna create_task here
-            await c.send(json.dumps(data))
+        msg = json.dumps(data)
+        for c in list(self.clients):
+            try:
+                await c.send(msg)
+            except websockets.exceptions.ConnectionClosed:
+                print(f"send_all failed - {c.name} already disconnected")
+                await self.handle_client_disconnect(c)
 
 
     async def add_client(self, client):
@@ -396,6 +408,11 @@ class Game:
         if disconnected_client in self.clients:
             self.clients.remove(disconnected_client)
 
+        # Reassign admin if the host left and there are remaining players
+        if disconnected_client == self.admin_socket and len(self.clients) > 0:
+            self.admin_socket = self.clients[0]
+            print(f"Admin reassigned to {self.admin_socket.name}")
+
         # Cancel ready timer if running
         if self.ready_timer:
             self.ready_timer.cancel()
@@ -412,17 +429,25 @@ class Game:
                 winner = self.get_last_alive()
                 if winner:
                     winner.set_winner()
-                    # Send opponent disconnect notification
-                    await winner.send(json.dumps({
-                        "type": "opponent_disconnect"
-                    }))
-                    # Only send win for private lobbies - matchmaking clients
-                    # handle the win sequence themselves and auto-reconnect
-                    if not self.is_matchmaking:
+                    try:
+                        # Send opponent disconnect notification
                         await winner.send(json.dumps({
-                            "type": "win"
+                            "type": "opponent_disconnect"
                         }))
-                self.state = self.GAME_STATE_BETWEEN
+                        # Only send win for private lobbies - matchmaking clients
+                        # handle the win sequence themselves and auto-reconnect
+                        if not self.is_matchmaking:
+                            await winner.send(json.dumps({
+                                "type": "win"
+                            }))
+                    except websockets.exceptions.ConnectionClosed:
+                        print(f"Winner {winner.name} also disconnected")
+                # For matchmaking, set FINISHED so process() exits and the
+                # server closes the WebSocket, triggering client auto-reconnect
+                if self.is_matchmaking:
+                    self.state = self.GAME_STATE_FINISHED
+                else:
+                    self.state = self.GAME_STATE_BETWEEN
             elif alive_count == 0:
                 # Everyone disconnected
                 self.state = self.GAME_STATE_FINISHED
@@ -433,10 +458,13 @@ class Game:
         elif self.state == self.GAME_STATE_BETWEEN:
             if len(self.clients) <= 1:
                 # Last opponent left - notify and end
-                for c in self.clients:
-                    await c.send(json.dumps({
-                        "type": "opponent_disconnect"
-                    }))
+                for c in list(self.clients):
+                    try:
+                        await c.send(json.dumps({
+                            "type": "opponent_disconnect"
+                        }))
+                    except websockets.exceptions.ConnectionClosed:
+                        print(f"Notify failed - {c.name} also disconnected")
                 self.state = self.GAME_STATE_FINISHED
             else:
                 # Still multiple players - just update the roster
