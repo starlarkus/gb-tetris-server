@@ -300,6 +300,10 @@ class Game:
             if client != self.admin_socket:
                 print("Error: Not an admin.")
                 return
+            # Need at least 2 players
+            if len(self.clients) < 2:
+                print("Error: Not enough players to start.")
+                return
             print("Starting game!")
             await self.start_game()
         elif msg["type"] == "update":
@@ -409,27 +413,31 @@ class Game:
                     await winner.send(json.dumps({
                         "type": "opponent_disconnect"
                     }))
-                    await winner.send(json.dumps({
-                        "type": "win"
-                    }))
+                    # Only send win for private lobbies - matchmaking clients
+                    # handle the win sequence themselves and auto-reconnect
+                    if not self.is_matchmaking:
+                        await winner.send(json.dumps({
+                            "type": "win"
+                        }))
                 self.state = self.GAME_STATE_BETWEEN
             elif alive_count == 0:
                 # Everyone disconnected
                 self.state = self.GAME_STATE_FINISHED
             else:
-                # Notify remaining players about the disconnect
+                # Multiple players still alive - game continues, just update info
+                await self.send_gameinfo()
+
+        elif self.state == self.GAME_STATE_BETWEEN:
+            if len(self.clients) <= 1:
+                # Last opponent left - notify and end
                 for c in self.clients:
                     await c.send(json.dumps({
                         "type": "opponent_disconnect"
                     }))
-
-        elif self.state == self.GAME_STATE_BETWEEN:
-            # Notify remaining players and end the game
-            for c in self.clients:
-                await c.send(json.dumps({
-                    "type": "opponent_disconnect"
-                }))
-            self.state = self.GAME_STATE_FINISHED
+                self.state = self.GAME_STATE_FINISHED
+            else:
+                # Still multiple players - just update the roster
+                await self.send_gameinfo()
 
         elif self.state == self.GAME_STATE_LOBBY:
             # Notify remaining players about updated roster
