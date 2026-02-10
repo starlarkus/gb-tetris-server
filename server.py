@@ -593,6 +593,10 @@ async def newserver(websocket):
 
                     for task in pending:
                         task.cancel()
+                        try:
+                            await task
+                        except (asyncio.CancelledError, websockets.exceptions.ConnectionClosed, Exception):
+                            pass
 
                     if match_task in done:
                         # We've been matched - break out to process game
