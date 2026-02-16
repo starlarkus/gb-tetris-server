@@ -137,6 +137,7 @@ class Game:
         self.is_matchmaking = is_matchmaking
         self.ready_clients = set()
         self.ready_timer = None
+        self.pending_clients = []  # Clients waiting to join between rounds
     
     def get_gameinfo(self):
         users = []
@@ -201,10 +202,23 @@ class Game:
 
 
     async def add_client(self, client):
-        if self.state != self.GAME_STATE_LOBBY:
-            raise("Game not in lobby")
-        self.clients.append(client)
-        await self.send_gameinfo()
+        if self.state in (self.GAME_STATE_LOBBY, self.GAME_STATE_BETWEEN):
+            self.clients.append(client)
+            client.state = Client.STATE_ALIVE
+            await self.send_gameinfo()
+        elif self.state == self.GAME_STATE_RUNNING and not self.is_matchmaking:
+            # Queue the client to join after the current round ends
+            self.pending_clients.append(client)
+            await client.send(json.dumps({
+                "type": "game_info",
+                "name": self.name,
+                "status": self.state,
+                "users": [c.serialize() for c in self.clients] + [client.serialize()],
+                "admin_uuid": self.admin_socket.uuid if self.admin_socket else None,
+                "pending": True
+            }))
+        else:
+            raise Exception("Cannot join game")
 
     async def start_game(self):
         self.ready_clients = set()
@@ -230,6 +244,14 @@ class Game:
             "tiles": pieces
         })
     
+    async def _add_pending_clients(self):
+        """Move any pending clients into the game now that the round is over."""
+        for client in self.pending_clients:
+            if client not in self.clients:
+                self.clients.append(client)
+                client.state = Client.STATE_ALIVE
+        self.pending_clients = []
+
     def alive_count(self):
         count = 0
         for c in self.clients:
@@ -341,6 +363,7 @@ class Game:
                     continue
                 c.set_dead()
             self.state = self.GAME_STATE_BETWEEN
+            await self._add_pending_clients()
             await self.send_reached_30_lines(client.uuid)
             await self.send_gameinfo()
         elif msg["type"] == "preset_rng":
@@ -381,6 +404,7 @@ class Game:
                     "type": "win"
                 }))
                 self.state = self.GAME_STATE_BETWEEN
+                await self._add_pending_clients()
             await self.send_gameinfo()
         elif msg["type"] == "ready_next":
             if self.state != self.GAME_STATE_BETWEEN:
@@ -557,9 +581,42 @@ async def newserver(websocket):
             return
 
         game = games[game_name]
+
+        # Don't allow joining matchmaking games or finished games
+        if game.is_matchmaking:
+            error = {
+                "type": "error",
+                "msg": "Game not found."
+            }
+            await websocket.send(json.dumps(error))
+            return
+        if game.state == Game.GAME_STATE_FINISHED:
+            error = {
+                "type": "error",
+                "msg": "Game not found."
+            }
+            await websocket.send(json.dumps(error))
+            return
+
         client.set_game(game)
 
         await game.add_client(client)
+
+        # If client was queued as pending (game is RUNNING), wait until
+        # they are moved into the clients list between rounds
+        if client in game.pending_clients:
+            print(f"{client.name} queued as pending, waiting for round to end")
+            try:
+                while client in game.pending_clients:
+                    try:
+                        await asyncio.wait_for(client.socket.recv(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        continue
+            except websockets.exceptions.ConnectionClosed:
+                print(f"Pending client {client.name} disconnected while waiting")
+                if client in game.pending_clients:
+                    game.pending_clients.remove(client)
+                return
 
         print("Sending gameinfo..")
         await game.send_gameinfo()
